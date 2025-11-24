@@ -28,7 +28,6 @@ if 'last_scan_time' not in st.session_state:
 # ==========================================
 LOG_FILE = "trade_history.csv"
 
-# Updated Lot Sizes for all Indices
 LOT_SIZES = {
     "Nifty 50": 25,
     "Bank Nifty": 15,
@@ -49,7 +48,6 @@ with st.sidebar.expander("🔐 Connection", expanded=True):
 
 # 2. Instrument Selection
 with st.sidebar.expander("📊 Instruments", expanded=True):
-    # Comprehensive List of F&O Indices
     DEFAULT_INSTRUMENTS = {
         "Nifty 50": "NSE_INDEX|Nifty 50",
         "Bank Nifty": "NSE_INDEX|Nifty Bank",
@@ -98,41 +96,29 @@ def log_message(msg, type="info"):
     st.session_state.logs.insert(0, {"time": timestamp, "msg": msg, "type": type})
 
 def save_trade_to_csv(trade_data):
-    """Appends closed trade details to CSV file"""
     file_exists = os.path.isfile(LOG_FILE)
-    
     with open(LOG_FILE, mode='a', newline='') as file:
         writer = csv.writer(file)
-        # Header if new file
         if not file_exists:
-            writer.writerow([
-                "Date", "Instrument", "Strategy", "Entry Time", "Exit Time", 
-                "Status", "Spot Entry", "Spot Exit", "Spot PnL", 
-                "Option", "Opt Entry", "Opt Exit", "Opt PnL", "Profit (INR)"
-            ])
-            
+            writer.writerow(["Date", "Instrument", "Strategy", "Entry Time", "Exit Time", "Status", "Spot Entry", "Spot Exit", "Spot PnL", "Option", "Opt Entry", "Opt Exit", "Opt PnL", "Profit (INR)"])
         writer.writerow([
-            datetime.now().strftime("%Y-%m-%d"),
-            trade_data['instrument'],
-            trade_data['reason'],
-            trade_data['entry_time'],
-            datetime.now().strftime("%H:%M:%S"),
-            trade_data['exit_status'],
-            f"{trade_data['entry_spot']:.2f}",
-            f"{trade_data['exit_spot']:.2f}",
-            f"{trade_data['spot_pnl']:.2f}",
-            f"{trade_data['opt_strike']} CE",
-            f"{trade_data['opt_entry']:.2f}",
-            f"{trade_data['opt_exit']:.2f}",
-            f"{trade_data['opt_pnl']:.2f}",
-            f"{trade_data['pnl_inr']:.2f}"
+            datetime.now().strftime("%Y-%m-%d"), trade_data['instrument'], trade_data['reason'], trade_data['entry_time'], datetime.now().strftime("%H:%M:%S"),
+            trade_data['exit_status'], f"{trade_data['entry_spot']:.2f}", f"{trade_data['exit_spot']:.2f}", f"{trade_data['spot_pnl']:.2f}",
+            f"{trade_data['opt_strike']} CE", f"{trade_data['opt_entry']:.2f}", f"{trade_data['opt_exit']:.2f}", f"{trade_data['opt_pnl']:.2f}", f"{trade_data['pnl_inr']:.2f}"
         ])
 
 def fetch_recent_data(token, key, days=5):
-    end_date = datetime.now().strftime("%Y-%m-%d")
+    # FIX 1: Set end_date to TOMORROW to capture TODAY'S live candles
+    # Upstox 'to_date' is exclusive or requires future date for current day data
+    end_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
     start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    url = f"https://api.upstox.com/v2/historical-candle/{quote(key)}/1minute/{end_date}/{start_date}"
+    
+    # Encode key for URL (handles spaces in 'Nifty 50')
+    encoded_key = quote(key)
+    
+    url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/1minute/{end_date}/{start_date}"
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
+    
     try:
         response = requests.get(url, headers=headers, timeout=5)
         data = response.json()
@@ -146,6 +132,21 @@ def fetch_recent_data(token, key, days=5):
             return df
     except: pass
     return pd.DataFrame()
+
+def get_live_quote(token, instrument_key):
+    # FIX 2: Use 'params' dict to handle URL encoding of keys like 'NSE_INDEX|Nifty 50'
+    url = "https://api.upstox.com/v2/market-quote/ltp"
+    params = {'instrument_key': instrument_key}
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
+    
+    try:
+        res = requests.get(url, headers=headers, params=params, timeout=3)
+        data = res.json()
+        if data['status'] == 'success':
+            # API returns: data: { "NSE_INDEX|Nifty 50": { "last_price": 24000.00 } }
+            return data['data'].get(instrument_key, {}).get('last_price', 0)
+    except: pass
+    return 0
 
 def calculate_indicators(df):
     if df.empty: return df
@@ -182,7 +183,7 @@ def get_option_contract(token, instrument_key, spot_price, signal_type, depth):
     if days_ahead < 0: days_ahead += 7
     expiry_date = (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
     
-    url = f"https://api.upstox.com/v2/option/chain"
+    url = "https://api.upstox.com/v2/option/chain"
     params = {'instrument_key': instrument_key, 'expiry_date': expiry_date}
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     
@@ -192,16 +193,9 @@ def get_option_contract(token, instrument_key, spot_price, signal_type, depth):
         if data.get('status') != 'success': return None
         options = data.get('data', [])
         
-        # Adjust Step Size based on Index
-        if "Sensex" in instrument_key:
-            step = 100
-        elif "Bank" in instrument_key: # Nifty Bank
-            step = 100
-        elif "Midcap" in instrument_key:
-            step = 25 # Midcap steps are smaller often? Or 50. Usually 25/50. Let's assume 50 for safety or stick to standard
-            step = 50
-        else:
-            step = 50 # Nifty, FinNifty
+        if "Sensex" in instrument_key or "Bank" in instrument_key: step = 100
+        elif "Midcap" in instrument_key: step = 25 
+        else: step = 50
             
         rounded_spot = round(spot_price / step) * step
         target_strike = rounded_spot - depth if signal_type == "BUY" else rounded_spot + depth
@@ -214,27 +208,26 @@ def get_option_contract(token, instrument_key, spot_price, signal_type, depth):
     except: return None
     return None
 
-def get_live_quote(token, instrument_key):
-    url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={instrument_key}"
-    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
-    try:
-        res = requests.get(url, headers=headers, timeout=3)
-        data = res.json()
-        if data['status'] == 'success': return data['data'].get(instrument_key, {}).get('last_price', 0)
-    except: pass
-    return 0
-
 def process_instrument(name, key, token, strategy_config, option_config):
     result = { "name": name, "key": key, "price": 0.0, "status": "Wait", "signal": False, "reason": "", "option": None }
     
+    # Get Live Quote First (More reliable for current price than candle)
+    live_ltp = get_live_quote(token, key)
+    
     df = fetch_recent_data(token, key)
-    if df.empty: return result
+    if df.empty: 
+        # Fallback if history fails but LTP works
+        if live_ltp > 0: result["price"] = live_ltp
+        return result
+        
     df = calculate_indicators(df)
     df = prepare_cpr(df)
     
     last = df.iloc[-1]
     prev = df.iloc[-2]
-    current_spot = last['Close']
+    
+    # Use live LTP if available, else candle close
+    current_spot = live_ltp if live_ltp > 0 else last['Close']
     result["price"] = current_spot
     
     signal = False
@@ -301,7 +294,10 @@ def run_parallel_scan():
     active_keys = list(st.session_state.active_trades.keys())
     for name in active_keys:
         trade = st.session_state.active_trades[name]
-        curr_spot = st.session_state.market_snapshot[name]['price']
+        
+        # Fetch fresh prices for management
+        curr_spot = get_live_quote(api_token, scan_list[name]) # Force fetch fresh spot
+        if curr_spot == 0: curr_spot = trade['entry_spot'] # Fallback
         
         # Option Price
         curr_opt = trade['opt_entry']
@@ -335,7 +331,6 @@ def run_parallel_scan():
             log_message(f"{name}: {exit_msg} | PnL: ₹{pnl_inr:.0f}", "success" if pnl_inr>0 else "error")
             st.toast(f"{name}: {exit_msg}", icon="💰")
             
-            # Prepare data for CSV
             trade['exit_spot'] = curr_spot
             trade['spot_pnl'] = spot_pnl
             trade['opt_exit'] = curr_opt
@@ -369,7 +364,10 @@ if st.session_state.active_trades:
     for name, t in st.session_state.active_trades.items():
         with st.container():
             col1, col2, col3, col4, col5 = st.columns(5)
-            curr = st.session_state.market_snapshot[name]['price']
+            # Use fresh fetched spot if available, else last snapshot
+            curr = get_live_quote(api_token, scan_list[name])
+            if curr == 0: curr = t['entry_spot']
+            
             col1.metric(name, f"{curr:.2f}")
             col2.metric("Option", f"{t['opt_strike']} CE", f"Entry: {t['opt_entry']}")
             col3.metric("Premium", f"{t.get('curr_opt_price',0):.2f}", delta=f"{t.get('opt_pnl',0):.2f}")
@@ -403,20 +401,3 @@ if st.sidebar.checkbox("Auto-Refresh"):
 
 if st.session_state.last_scan_time is None and api_token:
     run_parallel_scan()
-    
-    
-# ==========================================
-# DATA PERSISTENCE HELPER
-# ==========================================
-st.sidebar.divider()
-st.sidebar.header("💾 Data Management")
-if os.path.isfile(LOG_FILE):
-    with open(LOG_FILE, "rb") as f:
-        st.sidebar.download_button(
-            label="Download Trade History (CSV)",
-            data=f,
-            file_name="trade_history.csv",
-            mime="text/csv"
-        )
-else:
-    st.sidebar.write("No trade history yet.")
