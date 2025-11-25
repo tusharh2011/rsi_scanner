@@ -1,4 +1,6 @@
 streamlit
 pandas
+pandas_ta
 numpy
+plotly
 requests
