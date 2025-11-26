@@ -176,7 +176,13 @@ def fetch_live_data(token, key, session=None):
         df = df.sort_values('timestamp').reset_index(drop=True)
         cols = ['open', 'high', 'low', 'close']
         df[cols] = df[cols].apply(pd.to_numeric)
-        df['RSI'] = ta.rsi(df['close'], length=rsi_len)
+        
+        # Safe RSI Calculation
+        if len(df) > rsi_len:
+            df['RSI'] = ta.rsi(df['close'], length=rsi_len)
+        else:
+            df['RSI'] = None
+            
         df['EMA_50'] = ta.ema(df['close'], length=50)
         return df
     return pd.DataFrame()
@@ -196,6 +202,10 @@ def find_signal(i, df, row):
     if (row['high'] - row['low']) > 50: return None 
     curr_t = row['timestamp'].time()
     if curr_t < time(9, 30) or curr_t > time(14, 50): return None
+    
+    # Check if RSI is valid before proceeding
+    if pd.isna(row['RSI']): return None
+    
     prev_candle = df.iloc[i-1]
 
     # BUY Logic
@@ -207,12 +217,15 @@ def find_signal(i, df, row):
 
         for j in range(i-5, i-anchor_lookback, -1):
             prev = df.iloc[j]
+            # Ensure previous RSI is also valid
+            if pd.isna(prev['RSI']): continue
+            
             if (row['low'] < prev['low']) and (row['RSI'] > prev['RSI']):
                 if (i - j) < min_gap: continue
-                valley_found = any(df.iloc[k]['RSI'] >= 50 for k in range(j+1, i))
+                valley_found = any(df.iloc[k]['RSI'] >= 50 for k in range(j+1, i) if not pd.isna(df.iloc[k]['RSI']))
                 if check_valley and not valley_found: continue 
                 
-                valley_idx = next((k for k in range(j+1, i) if df.iloc[k]['RSI'] >= 50), None)
+                valley_idx = next((k for k in range(j+1, i) if not pd.isna(df.iloc[k]['RSI']) and df.iloc[k]['RSI'] >= 50), None)
                 if valley_idx is not None:
                     valley_time = df.iloc[valley_idx]['timestamp']
                     valley_rsi = df.iloc[valley_idx]['RSI']
@@ -223,7 +236,8 @@ def find_signal(i, df, row):
                     valley_str = "No Cross"
 
                 if prev['RSI'] < deep_hook_buy:
-                    if df['RSI'].iloc[j:i].max() < 70 and (row['RSI'] - prev['RSI']) > 10:
+                    rsi_max_window = df['RSI'].iloc[j:i].max()
+                    if not pd.isna(rsi_max_window) and rsi_max_window < 70 and (row['RSI'] - prev['RSI']) > 10:
                          return {'Type': 'BUY', 'Tier': 'Tier 1', 'Logic': f"Anchor {prev['RSI']:.1f}", 'SL Price': row['low'] - sl_buffer_pts, 'Anchor Time': prev['timestamp'], 'Valley Time': valley_str, 'Anchor RSI': prev['RSI'], 'Valley RSI': valley_rsi}
                 elif prev['RSI'] < 35 and tier_3_action == "Take Trade":
                      return {'Type': 'BUY', 'Tier': 'Tier 3', 'Logic': f"Weak Anchor {prev['RSI']:.1f}", 'SL Price': row['low'] - sl_buffer_pts, 'Anchor Time': prev['timestamp'], 'Valley Time': valley_str, 'Anchor RSI': prev['RSI'], 'Valley RSI': valley_rsi}
@@ -237,12 +251,15 @@ def find_signal(i, df, row):
 
         for j in range(i-5, i-anchor_lookback, -1):
             prev = df.iloc[j]
+            # Ensure previous RSI is also valid
+            if pd.isna(prev['RSI']): continue
+            
             if (row['high'] > prev['high']) and (row['RSI'] < prev['RSI']):
                 if (i - j) < min_gap: continue
-                valley_found = any(df.iloc[k]['RSI'] <= 50 for k in range(j+1, i))
+                valley_found = any(df.iloc[k]['RSI'] <= 50 for k in range(j+1, i) if not pd.isna(df.iloc[k]['RSI']))
                 if check_valley and not valley_found: continue
                 
-                valley_idx = next((k for k in range(j+1, i) if df.iloc[k]['RSI'] <= 50), None)
+                valley_idx = next((k for k in range(j+1, i) if not pd.isna(df.iloc[k]['RSI']) and df.iloc[k]['RSI'] <= 50), None)
                 if valley_idx is not None:
                     valley_time = df.iloc[valley_idx]['timestamp']
                     valley_rsi = df.iloc[valley_idx]['RSI']
@@ -253,7 +270,8 @@ def find_signal(i, df, row):
                     valley_str = "No Cross"
 
                 if prev['RSI'] > deep_hook_sell:
-                    if df['RSI'].iloc[j:i].min() > 30 and (prev['RSI'] - row['RSI']) > 10:
+                    rsi_min_window = df['RSI'].iloc[j:i].min()
+                    if not pd.isna(rsi_min_window) and rsi_min_window > 30 and (prev['RSI'] - row['RSI']) > 10:
                          return {'Type': 'SELL', 'Tier': 'Tier 1', 'Logic': f"Anchor {prev['RSI']:.1f}", 'SL Price': row['high'] + sl_buffer_pts, 'Anchor Time': prev['timestamp'], 'Valley Time': valley_str, 'Anchor RSI': prev['RSI'], 'Valley RSI': valley_rsi}
                 elif prev['RSI'] > 65 and tier_3_action == "Take Trade":
                      return {'Type': 'SELL', 'Tier': 'Tier 3', 'Logic': f"Weak Anchor {prev['RSI']:.1f}", 'SL Price': row['high'] + sl_buffer_pts, 'Anchor Time': prev['timestamp'], 'Valley Time': valley_str, 'Anchor RSI': prev['RSI'], 'Valley RSI': valley_rsi}
@@ -326,10 +344,11 @@ def analyze_instrument(name, key, token, session):
                     trade['SL'] = trade['Entry Price']; trade['Is_BE'] = True
                 elif trade['Is_BE']:
                     ema = row['EMA_50']
-                    if trade['Type']=='BUY' and row['low'] > ema:
-                        if ema > trade['SL']: trade['SL'] = ema - 2
-                    elif trade['Type']=='SELL' and row['high'] < ema:
-                        if ema < trade['SL']: trade['SL'] = ema + 2
+                    if not pd.isna(ema): # check if EMA is valid
+                        if trade['Type']=='BUY' and row['low'] > ema:
+                            if ema > trade['SL']: trade['SL'] = ema - 2
+                        elif trade['Type']=='SELL' and row['high'] < ema:
+                            if ema < trade['SL']: trade['SL'] = ema + 2
                         
             # Open New Trade
             if current_trade is None and new_signal:
@@ -500,6 +519,14 @@ if scan_btn or auto_refresh:
                             pnl_value = price_diff * lot_size
                             pnl_color = "#4CAF50" if pnl_value > 0 else "#FF5252"
                             
+                            # Safe formatting for RSI Values
+                            def safe_rsi_fmt(val):
+                                return f"{val:.1f}" if val is not None and not pd.isna(val) else "-"
+                                
+                            entry_rsi_str = safe_rsi_fmt(trade.get('Entry RSI'))
+                            anchor_rsi_str = safe_rsi_fmt(trade.get('Anchor RSI'))
+                            valley_rsi_str = safe_rsi_fmt(trade.get('Valley RSI'))
+                            
                             st.markdown(f'''
                             <div class="active-card">
                                 <div style="margin-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 4px;">
@@ -529,9 +556,9 @@ if scan_btn or auto_refresh:
                                         <p style="font-size: 1.25rem; font-weight: bold; color: {pnl_color}; margin: 2px 0;">{pnl_value:+.2f}</p>
                                     </div>
                                     <div style="flex: 0 0 110px; padding-left: 10px; border-left: 1px solid #464b5c;">
-                                        <p style="color: #888; margin: 0 0 2px 0; font-size: 0.7rem;">Entry: {trade.get('Entry RSI', 0):.1f}</p>
-                                        <p style="color: #888; margin: 0 0 2px 0; font-size: 0.7rem;">Anchor: {trade.get('Anchor RSI', 0):.1f}</p>
-                                        <p style="color: #888; margin: 0; font-size: 0.7rem;">Valley: {trade.get('Valley RSI', 0):.1f}</p>
+                                        <p style="color: #888; margin: 0 0 2px 0; font-size: 0.7rem;">Entry: {entry_rsi_str}</p>
+                                        <p style="color: #888; margin: 0 0 2px 0; font-size: 0.7rem;">Anchor: {anchor_rsi_str}</p>
+                                        <p style="color: #888; margin: 0; font-size: 0.7rem;">Valley: {valley_rsi_str}</p>
                                     </div>
                                     <div style="flex: 1; padding-left: 10px; border-left: 1px solid #464b5c;">
                                         <p style="color: #888; margin: 0; font-size: 0.7rem;">Logic</p>
@@ -555,7 +582,9 @@ if scan_btn or auto_refresh:
                                 day_open = res['df_today'].iloc[0]['open']
                                 day_high = res['df_today']['high'].max()
                                 day_low = res['df_today']['low'].min()
-                                curr_rsi = res['df_today'].iloc[-1]['RSI']
+                                
+                                # Use .get() to avoid KeyError if RSI column missing, though unlikely
+                                curr_rsi = res['df_today'].iloc[-1].get('RSI')
                                 
                                 change = curr_price - day_open
                                 pct_change = (change / day_open) * 100
@@ -571,7 +600,11 @@ if scan_btn or auto_refresh:
                                 </div>
                                 """, unsafe_allow_html=True)
                                 
-                                st.metric("RSI", f"{curr_rsi:.1f}")
+                                # FIXED: Check for None or NaN before formatting
+                                if curr_rsi is None or pd.isna(curr_rsi):
+                                    st.metric("RSI", "-")
+                                else:
+                                    st.metric("RSI", f"{curr_rsi:.1f}")
                             else:
                                 st.warning(f"{res['name']}: No Data")
                 else:
